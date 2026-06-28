@@ -1,16 +1,22 @@
-"""Phase 3 — deux nodes + une transition (dynamic flow).
+"""Phase 4 — router d'intention (branching, dynamic flow).
 
 Même pipeline voix qu'avant (SmallWebRTC dev local : Gladia fr -> OpenAI ->
 Cartesia Sonic, VAD Silero), piloté par un `FlowManager` (Pipecat Flows 1.0).
-Deux nodes reliés par une seule transition linéaire :
 
-  greeting  --(enregistrer_nom)-->  besoin
+Graphe de conversation :
 
-`greeting` accueille et demande le prénom ; quand l'appelant le donne, l'agent
-appelle `enregistrer_nom`, qui mémorise le prénom et transitionne vers `besoin`.
-`besoin` s'adresse à l'appelant par son prénom et demande l'objet de l'appel.
-Pas encore de branching ni de CRM — ça arrive aux phases suivantes. Lancé par le
-dev runner (`uv run bot.py`, UI http://localhost:7860/client).
+    greeting --(enregistrer_nom)--> router --+--(router_vendeur)----> vendeur
+                                             +--(router_estimation)-> vendeur
+                                             +--(router_acheteur)---> acheteur
+                                             +--(router_location)---> location
+
+`router` expose quatre edge functions ; le LLM appelle celle qui correspond à
+l'intention de l'appelant (branching). Vendre et faire estimer atterrissent tous
+deux dans le tunnel « vendeur » ; seul `state["sous_intention"]` les distingue
+(« vente_directe » vs « estimation »), ce qui servira en Phase 5 à adapter
+l'écriture CRM et le type de RDV. Les nodes d'intention restent des placeholders
+(aucune écriture CRM ici). Lancé par le dev runner (`uv run bot.py`, UI
+http://localhost:7860/client).
 """
 
 import os
@@ -46,7 +52,7 @@ ROLE_MESSAGE = (
     "haute : pas d'emojis, de listes à puces ni de mise en forme. Sois bref et naturel."
 )
 
-# En Phase 3 on ne sert que le transport SmallWebRTC en local. Les autres transports
+# En Phase 4 on ne sert que le transport SmallWebRTC en local. Les autres transports
 # (Daily, téléphonie) viendront aux phases ultérieures avec leurs extras dédiés.
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -56,35 +62,172 @@ transport_params = {
 }
 
 
-def create_besoin_node(prenom: str) -> NodeConfig:
-    """Crée le second node : l'agent demande l'objet de l'appel.
+# --- Nodes d'intention (terminaux pour cette phase, aucune fonction / CRM) ----------
 
-    Node terminal pour cette phase (aucune fonction, pas de branching). La persona
-    posée par `greeting` persiste, donc on ne re-pose pas `role_message`.
+
+def create_vendeur_node(sous_intention: str) -> NodeConfig:
+    """Crée le node « vendeur » (tunnel partagé vente directe / estimation).
+
+    L'appelant qui veut vendre OU faire estimer atterrit ici ; le message d'accueil
+    est adapté à `sous_intention` pour que la distinction soit audible, mais le node
+    reste terminal pour cette phase (aucune écriture CRM).
 
     Args:
-        prenom: Le prénom de l'appelant, pour une adresse personnalisée.
+        sous_intention: « vente_directe » ou « estimation ».
 
     Returns:
-        La configuration du node « besoin ».
+        La configuration du node « vendeur ».
+    """
+    if sous_intention == "estimation":
+        objectif = (
+            "L'appelant veut faire estimer la valeur de son bien. Confirme avec "
+            "enthousiasme que tu vas organiser une estimation et qu'un expert le "
+            "recontactera pour convenir d'un rendez-vous."
+        )
+    else:
+        objectif = (
+            "L'appelant souhaite mettre son bien en vente. Confirme avec enthousiasme "
+            "que tu vas l'accompagner pour la mise en vente et qu'un conseiller le "
+            "recontactera pour la suite."
+        )
+    return NodeConfig(
+        name="vendeur",
+        task_messages=[{"role": "developer", "content": objectif}],
+    )
+
+
+def create_acheteur_node() -> NodeConfig:
+    """Crée le node « acheteur » : l'appelant cherche à acheter.
+
+    Returns:
+        La configuration du node « acheteur ».
     """
     return NodeConfig(
-        name="besoin",
+        name="acheteur",
         task_messages=[
             {
                 "role": "developer",
                 "content": (
-                    f"Remercie {prenom} et demande-lui en une phrase l'objet de son "
-                    "appel (vendre, acheter, louer ou faire estimer un bien)."
+                    "L'appelant cherche à acheter un bien. Confirme que tu vas l'aider "
+                    "et indique qu'un conseiller reviendra vers lui avec des biens "
+                    "correspondants."
                 ),
             }
         ],
     )
 
 
+def create_location_node() -> NodeConfig:
+    """Crée le node « location » : l'appelant cherche à louer.
+
+    Returns:
+        La configuration du node « location ».
+    """
+    return NodeConfig(
+        name="location",
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    "L'appelant cherche à louer un bien. Confirme que tu vas l'aider et "
+                    "indique qu'un conseiller le recontactera avec les offres de "
+                    "location disponibles."
+                ),
+            }
+        ],
+    )
+
+
+# --- Edge functions du router : le LLM en choisit une selon l'intention -------------
+# Direct functions à paramètre `flow_manager` seul ; leur docstring sert de description
+# routante exposée au LLM. Pas de section Args (aucun paramètre métier à documenter).
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def router_vendeur(flow_manager: FlowManager) -> tuple[None, NodeConfig]:
+    """L'appelant souhaite VENDRE / mettre en vente un bien immobilier.
+
+    Returns:
+        Un tuple (résultat, node suivant) : transition vers le tunnel « vendeur ».
+    """
+    flow_manager.state["intention"] = "vendeur"
+    flow_manager.state["sous_intention"] = "vente_directe"
+    logger.info("Intention : vendeur / vente_directe")
+    return None, create_vendeur_node("vente_directe")
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def router_estimation(flow_manager: FlowManager) -> tuple[None, NodeConfig]:
+    """L'appelant souhaite faire ESTIMER la valeur d'un bien immobilier.
+
+    Returns:
+        Un tuple (résultat, node suivant) : transition vers le tunnel « vendeur ».
+    """
+    flow_manager.state["intention"] = "vendeur"
+    flow_manager.state["sous_intention"] = "estimation"
+    logger.info("Intention : vendeur / estimation")
+    return None, create_vendeur_node("estimation")
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def router_acheteur(flow_manager: FlowManager) -> tuple[None, NodeConfig]:
+    """L'appelant souhaite ACHETER un bien immobilier.
+
+    Returns:
+        Un tuple (résultat, node suivant) : transition vers le node « acheteur ».
+    """
+    flow_manager.state["intention"] = "acheteur"
+    logger.info("Intention : acheteur")
+    return None, create_acheteur_node()
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def router_location(flow_manager: FlowManager) -> tuple[None, NodeConfig]:
+    """L'appelant souhaite LOUER un bien immobilier.
+
+    Returns:
+        Un tuple (résultat, node suivant) : transition vers le node « location ».
+    """
+    flow_manager.state["intention"] = "location"
+    logger.info("Intention : location")
+    return None, create_location_node()
+
+
+# --- Router + accueil ----------------------------------------------------------------
+
+
+def create_router_node(prenom: str) -> NodeConfig:
+    """Crée le node router : demande l'objet de l'appel et branche vers l'intention.
+
+    Expose les quatre edge functions ; le LLM appelle celle qui correspond à la
+    réponse de l'appelant (vendre / estimer / acheter / louer). La persona posée
+    par `greeting` persiste, donc on ne re-pose pas `role_message`.
+
+    Args:
+        prenom: Le prénom de l'appelant, pour une adresse personnalisée.
+
+    Returns:
+        La configuration du node router.
+    """
+    return NodeConfig(
+        name="router",
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    f"Remercie {prenom} puis demande-lui en une phrase l'objet de son "
+                    "appel : vendre, faire estimer, acheter ou louer un bien. Dès que "
+                    "son intention est claire, appelle la fonction correspondante."
+                ),
+            }
+        ],
+        functions=[router_vendeur, router_estimation, router_acheteur, router_location],
+    )
+
+
 @flows_tool_options(cancel_on_interruption=False)
 async def enregistrer_nom(flow_manager: FlowManager, prenom: str) -> tuple[None, NodeConfig]:  # noqa: D417
-    """Enregistre le prénom de l'appelant puis passe au node « besoin ».
+    """Enregistre le prénom de l'appelant puis passe au node router.
 
     `flow_manager` est le premier paramètre injecté par Flows : on ne le documente
     pas volontairement (il ne fait pas partie du schema exposé au LLM).
@@ -93,18 +236,18 @@ async def enregistrer_nom(flow_manager: FlowManager, prenom: str) -> tuple[None,
         prenom: Le prénom communiqué par l'appelant.
 
     Returns:
-        Un tuple (résultat, node suivant) : pas de résultat, transition vers « besoin ».
+        Un tuple (résultat, node suivant) : pas de résultat, transition vers le router.
     """
     flow_manager.state["prenom"] = prenom
     logger.info(f"Prénom enregistré : {prenom}")
-    return None, create_besoin_node(prenom)
+    return None, create_router_node(prenom)
 
 
 def create_greeting_node() -> NodeConfig:
     """Crée le node initial : l'agent accueille et demande le prénom.
 
     Inbound, donc l'agent parle en premier (`respond_immediately=True`, défaut rendu
-    explicite). Expose `enregistrer_nom`, qui déclenche la transition vers « besoin ».
+    explicite). Expose `enregistrer_nom`, qui déclenche la transition vers le router.
 
     Returns:
         La configuration du node d'accueil.

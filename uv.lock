@@ -451,6 +451,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "pipecat-ai", extra = ["runner", "webrtc"] },
+    { name = "pipecat-ai-flows" },
     { name = "python-dotenv" },
 ]
 
@@ -462,6 +463,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pipecat-ai", extras = ["cartesia", "gladia", "openai", "runner", "silero", "webrtc"], specifier = ">=1.4.0" },
+    { name = "pipecat-ai-flows", specifier = ">=1.3.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
 ]
 
@@ -1504,6 +1506,20 @@ runner = [
 webrtc = [
     { name = "aiortc" },
     { name = "opencv-python" },
+]
+
+[[package]]
+name = "pipecat-ai-flows"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docstring-parser" },
+    { name = "loguru" },
+    { name = "pipecat-ai" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/32/fbb4b6c3f40041d0fb85dca37875e9b61a145541a28717dbbee8136f328a/pipecat_ai_flows-1.3.0.tar.gz", hash = "sha256:ee1b755d6f59d137c190a9c77ed0c33567d9f343ed0620fe7115922af7d0007f", size = 4940745, upload-time = "2026-06-18T21:51:57.349Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8e/e0/0519d20d9b711d84e8f6a6389b12f25e3b658d3271d3c0129758a66ae9f8/pipecat_ai_flows-1.3.0-py3-none-any.whl", hash = "sha256:b3cd097938c265b04d394da390a558ac7966e3220ebe164786f46275818c981b", size = 26194, upload-time = "2026-06-18T21:51:56.173Z" },
 ]
 
 [[package]]

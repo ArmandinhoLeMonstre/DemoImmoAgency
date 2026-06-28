@@ -1,9 +1,10 @@
-"""Phase 1 — agent vocal inbound (FR) : pipeline STT -> LLM -> TTS, sans Flows.
+"""Phase 2 — premier node Flows : greeting seul (dynamic flow).
 
-Pipeline SmallWebRTC (dev local) : Gladia (fr) -> OpenAI -> Cartesia (Sonic),
-VAD Silero. Lancé par le dev runner Pipecat (`uv run bot.py`, UI sur
-http://localhost:7860/client). La logique de qualification arrive aux phases
-suivantes ; ici on valide seulement que la voix fonctionne.
+Même pipeline voix qu'en Phase 1 (SmallWebRTC dev local : Gladia fr -> OpenAI ->
+Cartesia Sonic, VAD Silero), mais l'agent est désormais piloté par un
+`FlowManager` (Pipecat Flows 1.0, dynamic flows). Un unique node d'accueil :
+pas de fonction, pas de transition, pas de qualification — ça arrive aux phases
+suivantes. Lancé par le dev runner (`uv run bot.py`, UI http://localhost:7860/client).
 """
 
 import os
@@ -11,7 +12,6 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -28,19 +28,19 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
+from pipecat_flows import FlowManager, NodeConfig
 
 load_dotenv(override=True)
 
-# Persona FR de l'agent d'accueil. En Phase 1 il accueille et discute simplement :
-# pas encore de qualification structurée (vendeur/acheteur/...) ni de CRM.
-SYSTEM_INSTRUCTION = (
+# Persona FR de l'agent, posée une seule fois dans le node initial via `role_message`
+# (system instruction qui persiste entre nodes). Pas de qualification ni de CRM ici.
+ROLE_MESSAGE = (
     "Tu es l'agent vocal d'accueil d'une agence immobilière belge. Tu réponds en "
     "français, sur un ton chaleureux et professionnel. Tes réponses sont lues à voix "
-    "haute : pas d'emojis, de listes à puces ni de mise en forme. Sois bref et "
-    "naturel. Accueille l'appelant et demande comment tu peux l'aider."
+    "haute : pas d'emojis, de listes à puces ni de mise en forme. Sois bref et naturel."
 )
 
-# En Phase 1 on ne sert que le transport SmallWebRTC en local. Les autres transports
+# En Phase 2 on ne sert que le transport SmallWebRTC en local. Les autres transports
 # (Daily, téléphonie) viendront aux phases ultérieures avec leurs extras dédiés.
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -50,8 +50,33 @@ transport_params = {
 }
 
 
+def create_greeting_node() -> NodeConfig:
+    """Crée le node initial : l'agent accueille l'appelant.
+
+    Greeting seul : aucune fonction, aucune transition. Inbound, donc l'agent
+    parle en premier (`respond_immediately=True`, défaut rendu explicite).
+
+    Returns:
+        La configuration du node d'accueil.
+    """
+    return NodeConfig(
+        name="greeting",
+        role_message=ROLE_MESSAGE,
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    "Accueille chaleureusement l'appelant en une phrase et demande "
+                    "comment tu peux l'aider."
+                ),
+            }
+        ],
+        respond_immediately=True,
+    )
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
-    """Construit le pipeline STT -> LLM -> TTS et le fait tourner.
+    """Construit le pipeline voix, branche le FlowManager et fait tourner le worker.
 
     Args:
         transport: Transport fourni par le dev runner (SmallWebRTC en local).
@@ -79,16 +104,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         ),
     )
 
+    # Pas de system_instruction ici : c'est le `role_message` du node qui pose la
+    # persona (Pipecat Flows l'envoie via LLMUpdateSettingsFrame).
     llm = OpenAILLMService(
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAILLMService.Settings(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            system_instruction=SYSTEM_INSTRUCTION,
         ),
     )
 
     context = LLMContext()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+    context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
@@ -97,11 +123,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         [
             transport.input(),  # Entrée audio (utilisateur)
             stt,  # Gladia (fr)
-            user_aggregator,  # Tour de parole utilisateur
+            context_aggregator.user(),  # Tour de parole utilisateur
             llm,  # OpenAI
             tts,  # Cartesia (Sonic)
             transport.output(),  # Sortie audio (bot)
-            assistant_aggregator,  # Tour de parole assistant
+            context_aggregator.assistant(),  # Tour de parole assistant
         ]
     )
 
@@ -114,12 +140,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    flow_manager = FlowManager(
+        worker=worker,
+        llm=llm,
+        context_aggregator=context_aggregator,
+        transport=transport,
+    )
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        """Inbound : l'agent parle en premier dès la connexion du client."""
+        """Inbound : démarre le flow sur le node d'accueil dès la connexion."""
         logger.info("Client connecté")
-        context.add_message({"role": "developer", "content": "Accueille l'appelant en une phrase."})
-        await worker.queue_frames([LLMRunFrame()])
+        await flow_manager.initialize(create_greeting_node())
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

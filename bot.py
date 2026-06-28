@@ -258,9 +258,13 @@ def create_vendeur_qualif_node() -> NodeConfig:
             {
                 "role": "developer",
                 "content": (
-                    "Demande le délai de vente souhaité, la raison de la vente et si "
-                    "l'appelant est le seul propriétaire / décideur. Dès que tu as ces "
-                    "informations, appelle finaliser_vendeur."
+                    "Recueille trois informations, de façon conversationnelle et "
+                    "naturelle : le délai de vente souhaité, la raison de la vente, et "
+                    "si l'appelant est le seul propriétaire / décideur. N'appelle "
+                    "finaliser_vendeur QUE lorsque tu as réellement les trois. Si "
+                    "l'appelant ne répond qu'à une partie, remercie-le et relance "
+                    "gentiment sur l'information manquante, sans appeler la fonction, "
+                    "jusqu'à avoir les trois."
                 ),
             }
         ],

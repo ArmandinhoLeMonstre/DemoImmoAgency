@@ -1,10 +1,16 @@
-"""Phase 2 — premier node Flows : greeting seul (dynamic flow).
+"""Phase 3 — deux nodes + une transition (dynamic flow).
 
-Même pipeline voix qu'en Phase 1 (SmallWebRTC dev local : Gladia fr -> OpenAI ->
-Cartesia Sonic, VAD Silero), mais l'agent est désormais piloté par un
-`FlowManager` (Pipecat Flows 1.0, dynamic flows). Un unique node d'accueil :
-pas de fonction, pas de transition, pas de qualification — ça arrive aux phases
-suivantes. Lancé par le dev runner (`uv run bot.py`, UI http://localhost:7860/client).
+Même pipeline voix qu'avant (SmallWebRTC dev local : Gladia fr -> OpenAI ->
+Cartesia Sonic, VAD Silero), piloté par un `FlowManager` (Pipecat Flows 1.0).
+Deux nodes reliés par une seule transition linéaire :
+
+  greeting  --(enregistrer_nom)-->  besoin
+
+`greeting` accueille et demande le prénom ; quand l'appelant le donne, l'agent
+appelle `enregistrer_nom`, qui mémorise le prénom et transitionne vers `besoin`.
+`besoin` s'adresse à l'appelant par son prénom et demande l'objet de l'appel.
+Pas encore de branching ni de CRM — ça arrive aux phases suivantes. Lancé par le
+dev runner (`uv run bot.py`, UI http://localhost:7860/client).
 """
 
 import os
@@ -28,7 +34,7 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
-from pipecat_flows import FlowManager, NodeConfig
+from pipecat_flows import FlowManager, NodeConfig, flows_tool_options
 
 load_dotenv(override=True)
 
@@ -40,7 +46,7 @@ ROLE_MESSAGE = (
     "haute : pas d'emojis, de listes à puces ni de mise en forme. Sois bref et naturel."
 )
 
-# En Phase 2 on ne sert que le transport SmallWebRTC en local. Les autres transports
+# En Phase 3 on ne sert que le transport SmallWebRTC en local. Les autres transports
 # (Daily, téléphonie) viendront aux phases ultérieures avec leurs extras dédiés.
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -50,11 +56,55 @@ transport_params = {
 }
 
 
-def create_greeting_node() -> NodeConfig:
-    """Crée le node initial : l'agent accueille l'appelant.
+def create_besoin_node(prenom: str) -> NodeConfig:
+    """Crée le second node : l'agent demande l'objet de l'appel.
 
-    Greeting seul : aucune fonction, aucune transition. Inbound, donc l'agent
-    parle en premier (`respond_immediately=True`, défaut rendu explicite).
+    Node terminal pour cette phase (aucune fonction, pas de branching). La persona
+    posée par `greeting` persiste, donc on ne re-pose pas `role_message`.
+
+    Args:
+        prenom: Le prénom de l'appelant, pour une adresse personnalisée.
+
+    Returns:
+        La configuration du node « besoin ».
+    """
+    return NodeConfig(
+        name="besoin",
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    f"Remercie {prenom} et demande-lui en une phrase l'objet de son "
+                    "appel (vendre, acheter, louer ou faire estimer un bien)."
+                ),
+            }
+        ],
+    )
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def enregistrer_nom(flow_manager: FlowManager, prenom: str) -> tuple[None, NodeConfig]:  # noqa: D417
+    """Enregistre le prénom de l'appelant puis passe au node « besoin ».
+
+    `flow_manager` est le premier paramètre injecté par Flows : on ne le documente
+    pas volontairement (il ne fait pas partie du schema exposé au LLM).
+
+    Args:
+        prenom: Le prénom communiqué par l'appelant.
+
+    Returns:
+        Un tuple (résultat, node suivant) : pas de résultat, transition vers « besoin ».
+    """
+    flow_manager.state["prenom"] = prenom
+    logger.info(f"Prénom enregistré : {prenom}")
+    return None, create_besoin_node(prenom)
+
+
+def create_greeting_node() -> NodeConfig:
+    """Crée le node initial : l'agent accueille et demande le prénom.
+
+    Inbound, donc l'agent parle en premier (`respond_immediately=True`, défaut rendu
+    explicite). Expose `enregistrer_nom`, qui déclenche la transition vers « besoin ».
 
     Returns:
         La configuration du node d'accueil.
@@ -66,11 +116,12 @@ def create_greeting_node() -> NodeConfig:
             {
                 "role": "developer",
                 "content": (
-                    "Accueille chaleureusement l'appelant en une phrase et demande "
-                    "comment tu peux l'aider."
+                    "Accueille chaleureusement l'appelant, présente-toi comme l'accueil "
+                    "de l'agence et demande-lui son prénom."
                 ),
             }
         ],
+        functions=[enregistrer_nom],
         respond_immediately=True,
     )
 

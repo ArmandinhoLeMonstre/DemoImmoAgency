@@ -1,0 +1,25 @@
+[project]
+name = "demo-immo-agency"
+version = "0.1.0"
+description = "Agent vocal inbound pour agences immobilières belges (Pipecat)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pipecat-ai[cartesia,gladia,openai,runner,silero,webrtc]>=1.4.0",
+    "python-dotenv>=1.2.2",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.20",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

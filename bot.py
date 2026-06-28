@@ -1,24 +1,27 @@
-"""Phase 4 — router d'intention (branching, dynamic flow).
+"""Phase 5 — premier tool Odoo : qualification vendeur avec écritures progressives.
 
 Même pipeline voix qu'avant (SmallWebRTC dev local : Gladia fr -> OpenAI ->
 Cartesia Sonic, VAD Silero), piloté par un `FlowManager` (Pipecat Flows 1.0).
 
 Graphe de conversation :
 
-    greeting --(enregistrer_nom)--> router --+--(router_vendeur)----> vendeur
-                                             +--(router_estimation)-> vendeur
+    greeting --(enregistrer_nom)--> router --+--(router_vendeur)----> vendeur_contact
+                                             +--(router_estimation)-> vendeur_contact
                                              +--(router_acheteur)---> acheteur
                                              +--(router_location)---> location
 
-`router` expose quatre edge functions ; le LLM appelle celle qui correspond à
-l'intention de l'appelant (branching). Vendre et faire estimer atterrissent tous
-deux dans le tunnel « vendeur » ; seul `state["sous_intention"]` les distingue
-(« vente_directe » vs « estimation »), ce qui servira en Phase 5 à adapter
-l'écriture CRM et le type de RDV. Les nodes d'intention restent des placeholders
-(aucune écriture CRM ici). Lancé par le dev runner (`uv run bot.py`, UI
-http://localhost:7860/client).
+    vendeur_contact --(CREATE)--> vendeur_bien --(UPDATE)--> vendeur_qualif
+                    --(UPDATE)--> vendeur_fin
+
+Le tunnel vendeur écrit dans Odoo de façon PROGRESSIVE : un lead minimal est créé
+dès le contact, puis enrichi à chaque étape (un handler = une écriture). Toutes les
+écritures Odoo (synchrones, XML-RPC) passent par `asyncio.to_thread` bornées à
+`ODOO_TIMEOUT_SECS` pour ne jamais geler la voix ; tout échec/timeout est loggé et
+la conversation continue. acheteur / location restent des placeholders (Phase 6).
+Lancé par le dev runner (`uv run bot.py`, UI http://localhost:7860/client).
 """
 
+import asyncio
 import os
 
 from dotenv import load_dotenv
@@ -42,7 +45,13 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
 from pipecat_flows import FlowManager, NodeConfig, flows_tool_options
 
+from odoo_seller_tool import SellerLead, get_client
+
 load_dotenv(override=True)
+
+# Chaque écriture Odoo (XML-RPC synchrone) est bornée à ~4s : au-delà on logge et on
+# poursuit la conversation. Important pour la démo : un Odoo lent ne gèle pas la voix.
+ODOO_TIMEOUT_SECS = 4.0
 
 # Persona FR de l'agent, posée une seule fois dans le node initial via `role_message`
 # (system instruction qui persiste entre nodes). Pas de qualification ni de CRM ici.
@@ -52,7 +61,7 @@ ROLE_MESSAGE = (
     "haute : pas d'emojis, de listes à puces ni de mise en forme. Sois bref et naturel."
 )
 
-# En Phase 4 on ne sert que le transport SmallWebRTC en local. Les autres transports
+# En Phase 5 on ne sert que le transport SmallWebRTC en local. Les autres transports
 # (Daily, téléphonie) viendront aux phases ultérieures avec leurs extras dédiés.
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -62,38 +71,249 @@ transport_params = {
 }
 
 
-# --- Nodes d'intention (terminaux pour cette phase, aucune fonction / CRM) ----------
+# --- Tunnel vendeur : qualification + écritures Odoo progressives -------------------
+# Un handler = une écriture Odoo. Les écritures (XML-RPC synchrone) tournent dans un
+# thread (asyncio.to_thread) borné par ODOO_TIMEOUT_SECS ; échec/timeout -> log + on
+# poursuit. `state["seller_data"]` accumule les champs ; `state["lead_id"]` mémorise le
+# lead créé, partagé par les updates suivantes.
 
 
-def create_vendeur_node(sous_intention: str) -> NodeConfig:
-    """Crée le node « vendeur » (tunnel partagé vente directe / estimation).
+def _build_seller(seller_data: dict) -> SellerLead:
+    """Construit un SellerLead depuis l'accumulateur d'état.
 
-    L'appelant qui veut vendre OU faire estimer atterrit ici ; le message d'accueil
-    est adapté à `sous_intention` pour que la distinction soit audible, mais le node
-    reste terminal pour cette phase (aucune écriture CRM).
+    `sous_intention` est porté dans l'état mais n'est pas un champ SellerLead : on
+    l'exclut. Pydantic coerce les chaînes vers les enums PropertyType / Timeframe.
 
     Args:
-        sous_intention: « vente_directe » ou « estimation ».
+        seller_data: Champs collectés au fil de l'appel.
 
     Returns:
-        La configuration du node « vendeur ».
+        Un SellerLead validé.
     """
-    if sous_intention == "estimation":
-        objectif = (
-            "L'appelant veut faire estimer la valeur de son bien. Confirme avec "
-            "enthousiasme que tu vas organiser une estimation et qu'un expert le "
-            "recontactera pour convenir d'un rendez-vous."
+    fields = {k: v for k, v in seller_data.items() if k != "sous_intention"}
+    return SellerLead(**fields)
+
+
+def _build_call_summary(data: dict) -> str:
+    """Assemble un résumé d'appel par simple concaténation des champs collectés.
+
+    Pas d'appel LLM séparé : on agrège ce qu'on a déjà en mémoire d'état.
+
+    Args:
+        data: L'accumulateur `state["seller_data"]`.
+
+    Returns:
+        Un résumé d'une ligne.
+    """
+    parts = [
+        f"Vendeur {data.get('first_name', '')} {data.get('last_name', '')}".strip(),
+        f"intention {data.get('sous_intention', '?')}",
+        f"bien {data.get('property_type', '?')} à {data.get('city', '?')}",
+        f"prix {data.get('expected_price', '?')}",
+        f"délai {data.get('timeframe', '?')}",
+        f"raison {data.get('reason', '?')}",
+        f"propriétaire unique {data.get('sole_owner', '?')}",
+    ]
+    return " — ".join(parts) + "."
+
+
+async def _odoo_update(flow_manager: FlowManager, etape: str) -> None:
+    """Met à jour (une seule écriture) le lead Odoo courant depuis l'état.
+
+    Bornée à ODOO_TIMEOUT_SECS dans un thread ; ignorée s'il n'y a pas de lead_id
+    (création précédente échouée) ; tout échec/timeout est loggé et la conversation
+    continue.
+
+    Args:
+        flow_manager: Le FlowManager courant (porte l'état).
+        etape: Libellé court pour les logs (ex. « bien », « qualif »).
+    """
+    lead_id = flow_manager.state.get("lead_id")
+    if not lead_id:
+        logger.warning(f"update {etape} ignoré : pas de lead_id (création Odoo échouée)")
+        return
+    try:
+        seller = _build_seller(flow_manager.state["seller_data"])
+        await asyncio.wait_for(
+            asyncio.to_thread(lambda: get_client().update_lead(lead_id, seller)),
+            timeout=ODOO_TIMEOUT_SECS,
         )
-    else:
-        objectif = (
-            "L'appelant souhaite mettre son bien en vente. Confirme avec enthousiasme "
-            "que tu vas l'accompagner pour la mise en vente et qu'un conseiller le "
-            "recontactera pour la suite."
-        )
+        logger.info(f"Lead {lead_id} mis à jour ({etape})")
+    except asyncio.TimeoutError:
+        logger.error(f"Odoo update_lead ({etape}) : timeout >{ODOO_TIMEOUT_SECS}s — on poursuit")
+    except Exception as e:
+        logger.error(f"Odoo update_lead ({etape}) a échoué — on poursuit : {e}")
+
+
+def create_vendeur_contact_node() -> NodeConfig:
+    """Node 1 du tunnel vendeur : collecte du contact (nom + téléphone).
+
+    Returns:
+        La configuration du node « vendeur_contact ».
+    """
     return NodeConfig(
-        name="vendeur",
-        task_messages=[{"role": "developer", "content": objectif}],
+        name="vendeur_contact",
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    "Pour enregistrer la demande, demande à l'appelant son nom de "
+                    "famille et son numéro de téléphone. Dès que tu as les deux, "
+                    "appelle enregistrer_contact_vendeur."
+                ),
+            }
+        ],
+        functions=[enregistrer_contact_vendeur],
     )
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def enregistrer_contact_vendeur(  # noqa: D417
+    flow_manager: FlowManager, nom: str, telephone: str
+) -> tuple[None, NodeConfig]:
+    """Enregistre le contact du vendeur et CRÉE le lead Odoo (création minimale).
+
+    Args:
+        nom: Nom de famille du vendeur.
+        telephone: Numéro de téléphone du vendeur (format +32… si possible).
+
+    Returns:
+        Un tuple (résultat, node suivant) : transition vers « vendeur_bien ».
+    """
+    data = flow_manager.state.setdefault("seller_data", {})
+    data["first_name"] = flow_manager.state.get("prenom", "")
+    data["last_name"] = nom
+    data["phone"] = telephone
+    data["sous_intention"] = flow_manager.state.get("sous_intention", "vente_directe")
+    flow_manager.state["lead_id"] = None
+    try:
+        seller = _build_seller(data)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(lambda: get_client().create_lead_minimal(seller)),
+            timeout=ODOO_TIMEOUT_SECS,
+        )
+        flow_manager.state["lead_id"] = result["lead_id"]
+        logger.info(f"Lead vendeur créé (id={result['lead_id']}, priorité={result['priority']})")
+    except asyncio.TimeoutError:
+        logger.error(f"Odoo create_lead_minimal : timeout >{ODOO_TIMEOUT_SECS}s — on poursuit")
+    except Exception as e:
+        logger.error(f"Odoo create_lead_minimal a échoué — on poursuit : {e}")
+    return None, create_vendeur_bien_node()
+
+
+def create_vendeur_bien_node() -> NodeConfig:
+    """Node 2 du tunnel vendeur : caractéristiques du bien.
+
+    Returns:
+        La configuration du node « vendeur_bien ».
+    """
+    return NodeConfig(
+        name="vendeur_bien",
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    "Demande le type de bien (appartement, maison, terrain, commerce "
+                    "ou autre), la commune et le prix de vente espéré. Dès que tu as "
+                    "ces trois informations, appelle qualifier_bien_vendeur."
+                ),
+            }
+        ],
+        functions=[qualifier_bien_vendeur],
+    )
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def qualifier_bien_vendeur(  # noqa: D417
+    flow_manager: FlowManager, type_bien: str, ville: str, prix: float
+) -> tuple[None, NodeConfig]:
+    """Enregistre les caractéristiques du bien et MET À JOUR le lead Odoo.
+
+    Args:
+        type_bien: Type de bien. L'une des valeurs : "appartement", "maison",
+            "terrain", "commerce", "autre".
+        ville: Commune / ville du bien.
+        prix: Prix de vente espéré, en euros.
+
+    Returns:
+        Un tuple (résultat, node suivant) : transition vers « vendeur_qualif ».
+    """
+    data = flow_manager.state.setdefault("seller_data", {})
+    data["property_type"] = type_bien
+    data["city"] = ville
+    data["expected_price"] = prix
+    await _odoo_update(flow_manager, "bien")
+    return None, create_vendeur_qualif_node()
+
+
+def create_vendeur_qualif_node() -> NodeConfig:
+    """Node 3 du tunnel vendeur : qualifiers (délai, raison, propriétaire).
+
+    Returns:
+        La configuration du node « vendeur_qualif ».
+    """
+    return NodeConfig(
+        name="vendeur_qualif",
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    "Demande le délai de vente souhaité, la raison de la vente et si "
+                    "l'appelant est le seul propriétaire / décideur. Dès que tu as ces "
+                    "informations, appelle finaliser_vendeur."
+                ),
+            }
+        ],
+        functions=[finaliser_vendeur],
+    )
+
+
+@flows_tool_options(cancel_on_interruption=False)
+async def finaliser_vendeur(  # noqa: D417
+    flow_manager: FlowManager, delai: str, raison: str, proprietaire_unique: bool
+) -> tuple[None, NodeConfig]:
+    """Enregistre la qualification finale et MET À JOUR le lead Odoo.
+
+    Args:
+        delai: Délai de vente souhaité. L'une des valeurs : "asap", "1_month",
+            "3_months", "6_months_plus", "unsure".
+        raison: Raison de la vente (succession, déménagement, etc.).
+        proprietaire_unique: True si l'appelant est le seul propriétaire / décideur.
+
+    Returns:
+        Un tuple (résultat, node suivant) : transition vers « vendeur_fin ».
+    """
+    data = flow_manager.state.setdefault("seller_data", {})
+    data["timeframe"] = delai
+    data["reason"] = raison
+    data["sole_owner"] = proprietaire_unique
+    data["call_summary"] = _build_call_summary(data)
+    await _odoo_update(flow_manager, "qualif")
+    return None, create_vendeur_fin_node()
+
+
+def create_vendeur_fin_node() -> NodeConfig:
+    """Node terminal du tunnel vendeur : remerciement + promesse de rappel.
+
+    Returns:
+        La configuration du node « vendeur_fin ».
+    """
+    return NodeConfig(
+        name="vendeur_fin",
+        task_messages=[
+            {
+                "role": "developer",
+                "content": (
+                    "Remercie chaleureusement l'appelant pour ces informations et "
+                    "indique qu'un conseiller le recontactera très prochainement. "
+                    "Conclus l'échange."
+                ),
+            }
+        ],
+    )
+
+
+# --- Nodes acheteur / location (placeholders inchangés, Phase 6) --------------------
 
 
 def create_acheteur_node() -> NodeConfig:
@@ -153,7 +373,7 @@ async def router_vendeur(flow_manager: FlowManager) -> tuple[None, NodeConfig]:
     flow_manager.state["intention"] = "vendeur"
     flow_manager.state["sous_intention"] = "vente_directe"
     logger.info("Intention : vendeur / vente_directe")
-    return None, create_vendeur_node("vente_directe")
+    return None, create_vendeur_contact_node()
 
 
 @flows_tool_options(cancel_on_interruption=False)
@@ -166,7 +386,7 @@ async def router_estimation(flow_manager: FlowManager) -> tuple[None, NodeConfig
     flow_manager.state["intention"] = "vendeur"
     flow_manager.state["sous_intention"] = "estimation"
     logger.info("Intention : vendeur / estimation")
-    return None, create_vendeur_node("estimation")
+    return None, create_vendeur_contact_node()
 
 
 @flows_tool_options(cancel_on_interruption=False)
